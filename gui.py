@@ -43,6 +43,11 @@ class App(tk.Tk):
         self.pass_entry = ttk.Entry(conn_frame, show="*")
         self.pass_entry.grid(row=1, column=3, padx=5, pady=5, sticky=tk.EW)
 
+        # 접속 테스트 버튼
+        self.test_conn_button = ttk.Button(conn_frame, text="🔗 접속 테스트", command=self.test_connection_thread)
+        self.test_conn_button.grid(row=1, column=4, padx=10, pady=5)
+
+
         # --- 스캔 설정 프레임 ---
         scan_frame = ttk.LabelFrame(main_frame, text="스캔 설정", padding="10")
         scan_frame.pack(fill=tk.X, pady=5)
@@ -119,20 +124,67 @@ class App(tk.Tk):
         )
         scan_thread.start()
 
+    def test_connection_thread(self):
+        """연결 테스트를 별도의 스레드에서 실행합니다."""
+        host = self.host_entry.get()
+        port = self.port_entry.get()
+        user = self.user_entry.get()
+        password = self.pass_entry.get()
+
+        if not all([host, port, user]):
+            messagebox.showerror("입력 오류", "호스트, 포트, 사용자명은 반드시 입력해야 합니다.")
+            return
+
+        self.test_conn_button.config(state=tk.DISABLED)
+        self.update_status("연결 테스트 중...")
+
+        test_thread = threading.Thread(
+            target=self._execute_connection_test,
+            args=(host, port, user, password),
+            daemon=True
+        )
+        test_thread.start()
+
+    def _execute_connection_test(self, host, port, user, password):
+        """실제 연결 테스트를 수행하고 결과를 큐에 넣습니다."""
+        temp_queue = queue.Queue()
+        # 연결 테스트 시에는 GUI 상태 업데이트 콜백만 필요
+        scanner = RemoteScanner(temp_queue, self.update_status)
+
+        if scanner.connect(host, port, user, password):
+            scanner.disconnect()
+            self.result_queue.put("CONN_SUCCESS")
+        else:
+            # connect 메서드가 실패 시 넣는 오류 메시지를 가져옴
+            try:
+                error_msg = temp_queue.get_nowait() # 예: "오류: 접속 실패: ..."
+                self.result_queue.put(f"CONN_FAILURE:{error_msg}")
+            except queue.Empty:
+                self.result_queue.put("CONN_FAILURE:알 수 없는 오류가 발생했습니다.")
+
     def process_queue(self):
         """주기적으로 큐를 확인하여 GUI를 업데이트합니다."""
         try:
-            while True:
-                msg = self.result_queue.get_nowait()
-                if isinstance(msg, dict):
-                    self.result_tree.insert("", tk.END, values=(msg["filepath"], msg["details"]))
-                elif isinstance(msg, str) and msg.startswith("오류:"):
-                    messagebox.showerror("오류", msg)
-                elif msg == "FINISH":
-                    self.scan_button.config(state=tk.NORMAL)
-                    self.update_status("스캔 완료. 대기중...")
-                    messagebox.showinfo("완료", "모든 스캔 작업이 완료되었습니다.")
-                    break # 추가적인 FINISH 메시지 처리를 막기 위해 루프 종료
+            msg = self.result_queue.get_nowait()
+
+            if isinstance(msg, dict):
+                self.result_tree.insert("", tk.END, values=(msg["filepath"], msg["details"]))
+            elif isinstance(msg, str) and msg.startswith("오류:"):
+                messagebox.showerror("스캔 오류", msg)
+            elif msg == "CONN_SUCCESS":
+                self.test_conn_button.config(state=tk.NORMAL)
+                self.update_status("대기중...")
+                messagebox.showinfo("연결 테스트", "원격 서버에 성공적으로 연결되었습니다.")
+            elif isinstance(msg, str) and msg.startswith("CONN_FAILURE:"):
+                self.test_conn_button.config(state=tk.NORMAL)
+                self.update_status("대기중...")
+                error_detail = msg.split(":", 1)[1]
+                messagebox.showerror("연결 테스트 실패", error_detail)
+            elif msg == "FINISH":
+                self.scan_button.config(state=tk.NORMAL)
+                self.update_status("스캔 완료. 대기중...")
+                messagebox.showinfo("완료", "모든 스캔 작업이 완료되었습니다.")
+
         except queue.Empty:
             pass
         finally:
