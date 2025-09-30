@@ -43,7 +43,9 @@ class RemoteScanner:
     def _load_patterns(self):
         """conf/pattern.ini 파일에서 정규식 패턴을 로드합니다."""
         patterns = []
-        parser = configparser.ConfigParser()
+        # RawConfigParser를 사용하여 정규식의 '%'와 같은 특수 문자가 보간(interpolation) 기능으로
+        # 해석되어 발생하는 오류를 방지합니다.
+        parser = configparser.RawConfigParser()
         try:
             parser.read('conf/pattern.ini', encoding='utf-8')
             for section in parser.sections():
