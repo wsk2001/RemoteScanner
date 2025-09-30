@@ -113,56 +113,61 @@ class RemoteScanner:
     def scan_file(self, filepath):
         """
         단일 원격 파일을 스캔하여 민감 정보를 찾습니다.
-        파일을 직접 읽는 대신 원격에서 grep을 실행하여 결과만 가져옵니다.
+        모든 패턴을 하나로 묶어 grep을 한 번만 실행하고, 결과를 가져와 Python에서 분석합니다.
+        이 방식은 SSH 연결 오버헤드를 줄이고, 쉘 이스케이핑 문제를 회피하여 정확성과 성능을 높입니다.
         """
         try:
-            found_by_alias = {}
+            if not self.patterns:
+                return  # 스캔할 패턴이 없으면 종료
 
-            # 각 패턴에 대해 원격으로 grep 명령 실행
-            for p in self.patterns:
-                alias = p['alias']
-                regex_str = p['regex'].pattern
+            # 1. 모든 패턴을 '|'로 묶어 하나의 거대 패턴 생성
+            # 각 패턴을 괄호로 감싸서 개별 패턴의 무결성 보장
+            combined_regex = "|".join(f"({p['regex'].pattern})" for p in self.patterns)
 
-                # 쉘에서 정규식이 깨지지 않도록 작은따옴표로 감싸고, 파일 경로는 큰따옴표로 감쌉니다.
-                command = f"grep -oE '{regex_str}' \"{filepath}\" | wc -l"
+            # 2. 파일당 한 번만 grep 실행하여 일치하는 모든 문자열을 가져옴
+            command = f"grep -oP '{combined_regex}' \"{filepath}\""
 
-                stdin, stdout, stderr = self.ssh.exec_command(command, timeout=15)
+            stdin, stdout, stderr = self.ssh.exec_command(command, timeout=30)
+            matched_lines = stdout.read().decode('utf-8', errors='ignore').splitlines()
+            err_str = stderr.read().decode('utf-8', errors='ignore').strip()
 
-                count_str = stdout.read().decode('utf-8').strip()
-                err_str = stderr.read().decode('utf-8').strip()
+            # 오류 처리
+            if err_str:
+                if "No such file or directory" in err_str or "Permission denied" in err_str:
+                    self.logger.error(f"파일 접근 불가, 스캔 중단 [{filepath}]: {err_str}")
+                    return # 이 파일 스캔 중단
+                # 바이너리 파일 경고는 무시
+                elif "binary file matches" not in err_str.lower():
+                    self.logger.warning(f"Grep 실행 중 경고 [{filepath}]: {err_str}")
 
-                # grep 실행 중 오류가 발생하면 로그를 남기고 해당 파일의 스캔을 중단합니다.
-                if err_str:
-                    if "No such file or directory" in err_str or "Permission denied" in err_str:
-                        self.logger.error(f"파일 접근 불가, 스캔 중단 [{filepath}]: {err_str}")
-                        return # 이 파일에 대한 스캔을 완전히 중단.
-                    else:
-                        # 그 외의 stderr 출력은 경고로 로깅 (예: 바이너리 파일 경고)
-                        self.logger.warning(f"Grep 실행 중 경고 [{filepath}] 패턴 [{alias}]: {err_str}")
+            if not matched_lines:
+                return  # 일치하는 내용이 없으면 종료
 
+            # 3. Python에서 결과 분석 및 카운팅
+            found_by_alias = {p['alias']: 0 for p in self.patterns}
+            for line in matched_lines:
+                for p in self.patterns:
+                    # fullmatch를 사용하여 grep -o로 나온 결과 전체가 패턴과 일치하는지 확인
+                    if p['regex'].fullmatch(line.strip()):
+                        found_by_alias[p['alias']] += 1
+                        break  # 다음 라인으로
 
-                count = int(count_str)
-                if count > 0:
-                    found_by_alias[alias] = count
+            # 검출된 항목만 필터링
+            final_counts = {alias: count for alias, count in found_by_alias.items() if count > 0}
 
-            total_found_count = sum(found_by_alias.values())
+            if not final_counts:
+                return
 
-            # 모든 패턴에 대한 스캔이 끝난 후, 결과가 있으면 보고합니다.
-            if total_found_count > 0:
-                details_str = ", ".join([f"{alias}: {count}" for alias, count in found_by_alias.items()])
-                result_msg = f"검출 완료 [{filepath}] 총 {total_found_count}개 ({details_str})"
+            # 4. 결과 보고
+            total_found_count = sum(final_counts.values())
+            details_str = ", ".join([f"{alias}: {count}" for alias, count in final_counts.items()])
+            result_msg = f"검출 완료 [{filepath}] 총 {total_found_count}개 ({details_str})"
 
-                # 로그 파일에 기록
-                self.logger.info(result_msg)
-                # GUI에 전달
-                self.result_queue.put({"filepath": filepath, "details": f"총 {total_found_count}개 ({details_str})"})
+            self.logger.info(result_msg)
+            self.result_queue.put({"filepath": filepath, "details": f"총 {total_found_count}개 ({details_str})"})
 
-        except ValueError:
-            # int(count_str) 변환 실패 시
-            self.logger.warning(f"Grep 결과 파싱 오류 [{filepath}]. 응답: '{count_str}'")
         except Exception as e:
-            # SSHException, Timeout 등
-            self.logger.error(f"예상치 못한 오류 발생 [{filepath}]: {e}")
+            self.logger.error(f"예상치 못한 스캔 오류 발생 [{filepath}]: {e}")
 
 
     def start_scan(self, host, port, username, password, start_path, extensions):
